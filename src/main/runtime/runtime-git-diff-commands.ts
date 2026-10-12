@@ -27,7 +27,7 @@ export class RuntimeGitDiffCommands {
     maxContentBytes?: number
   ): Promise<GitDiffResult> {
     const target = await this.host.resolveRuntimeGitTarget(worktreeSelector)
-    const relativePath = normalizeRuntimeGitRelativePath(filePath)
+    const relativePath = normalizeRuntimeGitRelativePath(filePath, target)
     return assertGitDiffWithinTransportBudget(
       await requireRuntimeGitProvider(target).getDiff(
         target.worktree.path,
@@ -66,8 +66,8 @@ export class RuntimeGitDiffCommands {
     maxContentBytes?: number
   ): Promise<GitDiffResult> {
     const target = await this.host.resolveRuntimeGitTarget(worktreeSelector)
-    const relativePath = normalizeRuntimeGitRelativePath(filePath)
-    const oldRelativePath = oldPath ? normalizeRuntimeGitRelativePath(oldPath) : undefined
+    const relativePath = normalizeRuntimeGitRelativePath(filePath, target)
+    const oldRelativePath = oldPath ? normalizeRuntimeGitRelativePath(oldPath, target) : undefined
     requireLocalRuntimeGitRoute(target)
     return assertGitDiffWithinTransportBudget(
       await getBranchDiff(
@@ -112,7 +112,7 @@ export class RuntimeGitDiffCommands {
     line: number
   ): Promise<string | null> {
     const target = await this.host.resolveRuntimeGitTarget(worktreeSelector)
-    const normalizedRelativePath = normalizeRuntimeGitRelativePath(relativePath)
+    const normalizedRelativePath = normalizeRuntimeGitRelativePath(relativePath, target)
     return requireRuntimeGitProvider(target).getRemoteFileUrl(
       target.worktree.path,
       normalizedRelativePath,
