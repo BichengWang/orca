@@ -60,7 +60,18 @@ describe.skipIf(process.platform === 'win32')('runtime commit diff POSIX path id
     repo = await mkdtemp(path.join(tmpdir(), 'orca-commit-diff-paths-'))
     const root = repo
     const git = async (args: string[]): Promise<string> => {
-      const result = await runProcess({ program: 'git', args, cwd: root })
+      const result = await runProcess({
+        program: 'git',
+        args,
+        cwd: root,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'Test User',
+          GIT_AUTHOR_EMAIL: 'test@example.com',
+          GIT_COMMITTER_NAME: 'Test User',
+          GIT_COMMITTER_EMAIL: 'test@example.com'
+        }
+      })
       expect(result.code, result.stderr).toBe(0)
       return result.stdout.trim()
     }
