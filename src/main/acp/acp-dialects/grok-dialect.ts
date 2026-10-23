@@ -1,8 +1,12 @@
 import { z } from 'zod'
 import { acpNotificationEnvelopeSchema } from '../acp-context-usage'
-import type { AcpDialect, AcpDialectNotification } from './acp-dialect'
+import type { AcpDialect, AcpDialectNotification, AcpHookBlock } from './acp-dialect'
 import { grokRequest, grokSettleRequest } from './grok-requests'
 import { grokBackgroundTaskNotification, grokToolBackgroundTasks } from './grok-background-tasks'
+import { grokModelEfforts } from './grok-model-catalog'
+import { grokSubagentNotification, grokToolSubagents } from './grok-subagents'
+import { grokSubagentStop } from './grok-subagent-stop'
+import { grokBackgroundTaskStop } from './grok-background-task-stop'
 
 const tokenCount = z.number().int().nonnegative()
 const toolMetaSchema = z.object({ 'x.ai/tool': z.object({ name: z.string().min(1) }) })
@@ -28,9 +32,14 @@ const promptCompleteSchema = z.looseObject({
   stopReason: z.string(),
   agentResult: z.string().nullish()
 })
+const hookDeniedSchema = z.looseObject({
+  cancellationCategory: z.literal('HookDenied'),
+  cancellationContext: z.looseObject({ reason: z.string().optional() }).nullish()
+})
 const promptErrorDataSchema = z.looseObject({ message: z.string() })
 /** Grok writes its result text as the failure's reason only for these ends. */
 const FAILED_STOP_REASONS = ['error', 'rate_limit']
+const SESSION_NOTIFICATIONS = ['x.ai/session_notification', 'x.ai/session/update']
 
 function failureDetail(stopReason: string, result: string | null | undefined): string | undefined {
   return FAILED_STOP_REASONS.includes(stopReason) && result?.trim() ? result : undefined
@@ -69,15 +78,42 @@ function contextWindow(models: unknown): number | undefined {
   )
 }
 
+/** Grok ends a hook-denied prompt as `cancelled`, naming the hook's verdict in `_meta`. */
+function hookBlock(meta: unknown): AcpHookBlock | undefined {
+  const parsed = hookDeniedSchema.safeParse(meta)
+  const reason = parsed.data?.cancellationContext?.reason?.trim()
+  return parsed.success ? (reason ? { reason } : {}) : undefined
+}
+
 function completionEnd(
-  completion: z.infer<typeof completionSchema>
+  completion: z.infer<typeof completionSchema>,
+  meta: unknown
 ): NonNullable<Extract<AcpDialectNotification, { disposition: 'map' }>['end']> {
   const detail = failureDetail(completion.stop_reason, completion.agent_result)
+  const blocked = hookBlock(meta)
   return {
     stopReason: completion.stop_reason,
     durationMs: completion.elapsed_ms,
-    ...(detail ? { failureDetail: detail } : {})
+    ...(detail ? { failureDetail: detail } : {}),
+    ...(blocked ? { hookBlock: blocked } : {})
   }
+}
+
+function subagentSessionEnd(method: string, params: unknown): 'completed' | 'stopped' | undefined {
+  const canonical = method.startsWith('_') ? method.slice(1) : method
+  if (method !== 'session/update' && !SESSION_NOTIFICATIONS.includes(canonical)) {
+    return undefined
+  }
+  const envelope = acpNotificationEnvelopeSchema.safeParse(params)
+  const completion = envelope.success ? completionSchema.safeParse(envelope.data.update) : null
+  if (!completion?.success) {
+    return undefined
+  }
+  return completion.data.stop_reason === 'cancelled'
+    ? 'stopped'
+    : completion.data.stop_reason === 'end_turn'
+      ? 'completed'
+      : undefined
 }
 
 function notification(
@@ -112,10 +148,7 @@ function notification(
       ? { disposition: 'map', turn: parsed.data.runningPromptId, started: true }
       : { disposition: 'ignore' }
   }
-  if (
-    method !== 'session/update' &&
-    !['x.ai/session_notification', 'x.ai/session/update'].includes(canonical)
-  ) {
+  if (method !== 'session/update' && !SESSION_NOTIFICATIONS.includes(canonical)) {
     return canonical.startsWith('x.ai/') ? { disposition: 'ignore' } : undefined
   }
   const parsed = acpNotificationEnvelopeSchema.safeParse(params)
@@ -123,6 +156,14 @@ function notification(
     return method === 'session/update' ? undefined : { disposition: 'ignore' }
   }
   const envelope = parsed.data
+  const subagent = grokSubagentNotification(envelope.update)
+  if (subagent) {
+    return {
+      disposition: 'map',
+      ...(envelope._meta?.isReplay === true ? { replay: true } : {}),
+      subagents: [subagent]
+    }
+  }
   const meta = turnMetaSchema.safeParse(envelope._meta)
   const completion = completionSchema.safeParse(envelope.update)
   const response = responseSchema.safeParse(envelope.update)
@@ -145,7 +186,7 @@ function notification(
     ...(turn === undefined ? {} : { turn }),
     ...(meta.success && meta.data.turnStartMs !== undefined ? { at: meta.data.turnStartMs } : {}),
     replay: envelope._meta?.isReplay === true,
-    ...(completion.success ? { end: completionEnd(completion.data) } : {}),
+    ...(completion.success ? { end: completionEnd(completion.data, envelope._meta) } : {}),
     ...(retryFailure ? { failureDetail: retryFailure } : {}),
     ...(response.success
       ? {
@@ -167,6 +208,8 @@ function notification(
 }
 
 export const GROK_ACP_DIALECT: AcpDialect = {
+  subagentStop: grokSubagentStop,
+  backgroundTaskStop: grokBackgroundTaskStop,
   injectedPromptIdentity: true,
   toolName: (update) => {
     const parsed = toolMetaSchema.safeParse(update._meta)
@@ -175,11 +218,12 @@ export const GROK_ACP_DIALECT: AcpDialect = {
   request: grokRequest,
   settleRequest: grokSettleRequest,
   toolBackgroundTasks: grokToolBackgroundTasks,
+  toolSubagents: grokToolSubagents,
+  subagentSessionEnd,
   notification,
   contextWindow,
+  modelEfforts: grokModelEfforts,
+  hookBlock,
   promptErrorDetail: (error) => promptErrorDataSchema.safeParse(error.data).data?.message,
-  failedTurnText: (stopReason) =>
-    stopReason === 'rate_limit'
-      ? 'Grok usage limit reached.'
-      : 'Grok ended this turn with an error.'
+  failedTurnText: () => 'Grok ended this turn with an error.'
 }

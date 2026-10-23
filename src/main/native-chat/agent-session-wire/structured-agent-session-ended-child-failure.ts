@@ -21,8 +21,9 @@ const ENDED_CHILD_FAILURE = {
   'user-stop': () => null,
   // The user closing this chat closes what was queued before it; see `closeWhatTheUserClosed`.
   'user-close': () => null,
+  'context-clear': () => null,
   // The host stopping the child is Orca's cause, never the provider's: a start that never finished.
-  'host-stop': () => ({ failure: agentSessionFailureFact('hostStopped') }),
+  'host-stop': (ended) => ({ failure: ended.failure ?? agentSessionFailureFact('hostStopped') }),
   exit: providerEndFailure,
   // The attach records its own fault as the end's failure.
   'attach-failed': providerEndFailure,

@@ -30,6 +30,9 @@ import {
 import { structuredAgentSessionFailureWordsContext } from './structured-agent-session-send-preparation'
 import { providerExecutableMissing } from '../../provider-process/provider-executable-missing'
 import { argumentProblemOf } from '../structured-agent-arguments-error'
+import { agentCliInstallationProblemOf } from '../agent-cli-installation-error'
+import { agentCliInstallationFacts } from '../../../shared/agent-cli-installation-problem'
+import { providerDiagnosticOf } from '../../../shared/agent-session-failure'
 
 /** Who a failed acquisition's sentence names, and whether it was the session's first start. */
 export type FailedAcquisitionWording = {
@@ -49,6 +52,7 @@ function failedAcquisitionWireRefusal(
   const { reason } = structuredAgentSessionStartFailure(
     {
       refusal,
+      diagnostic: providerDiagnosticOf(error),
       argumentProblem: argumentProblemOf(error),
       ...(wording.newSession ? { newSession: true as const } : {})
     },
@@ -111,6 +115,10 @@ function isExitProvenAcquisitionFailure(error: unknown): error is Error {
 function failedAcquisitionDetails(
   error: unknown
 ): AgentSessionRefusalDetailsByCode['agent_session_operation_invalid'] | undefined {
+  const installation = agentCliInstallationProblemOf(error)
+  if (installation) {
+    return { reason: 'attachFailed', ...agentCliInstallationFacts(installation) }
+  }
   const argumentProblem = argumentProblemOf(error)
   if (argumentProblem) {
     return { reason: 'attachFailed', argumentProblem }
@@ -140,7 +148,8 @@ export function failedAcquisitionRefusal(
   if (
     error instanceof AgentSessionAcquisitionRefusal ||
     isExitProvenAcquisitionFailure(error) ||
-    (isAgentSessionPreSpawnError(error) && argumentProblemOf(error))
+    (isAgentSessionPreSpawnError(error) &&
+      (argumentProblemOf(error) || agentCliInstallationProblemOf(error)))
   ) {
     return {
       ok: false,

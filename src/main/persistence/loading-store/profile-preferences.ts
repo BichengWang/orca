@@ -1,8 +1,14 @@
 import type { GlobalSettings } from '../../../shared/global-settings-types'
+import { retireAtRestCommandSettings } from '../../native-chat/agent-session-wire/at-rest-command-context'
 import type { OnboardingChecklistState } from '../../../shared/onboarding-state-types'
 import type { PersistedState } from '../../../shared/persisted-state-types'
 import { getDefaultOnboardingState } from '../../../shared/onboarding-defaults'
 import type { FeatureInteractionId } from '../../../shared/feature-interactions'
+import {
+  nativeChatUpgradeTipVariant,
+  parseNativeChatUpgradeTipAudience,
+  type NativeChatUpgradeTipVariant
+} from '../../../shared/native-chat-upgrade-tip-audience'
 import {
   updateSettings as updateSettingsOperation,
   type SettingsMutationOperations
@@ -24,6 +30,7 @@ type ProfilePreferencesRuntime = Pick<
   | 'activeViewPreference'
   | 'githubCacheDirty'
   | 'githubCacheGeneration'
+  | 'githubCacheWriteListeners'
   | 'protectedSecrets'
   | 'runDurableMutation'
   | 'settingsChangeListeners'
@@ -112,6 +119,7 @@ export class ProfilePreferences {
             }
           }
           runtime.state.settings = restoredSettings
+          retireAtRestCommandSettings(updateKeys)
         }
       }
     })
@@ -166,6 +174,15 @@ export class ProfilePreferences {
     return this.getOnboarding()
   }
 
+  /** Fails closed: a missing or damaged record reads as no tip. */
+  getNativeChatUpgradeTipVariant(): NativeChatUpgradeTipVariant {
+    return nativeChatUpgradeTipVariant(
+      parseNativeChatUpgradeTipAudience(
+        this[profilePreferencesContext].runtime.state.nativeChatUpgradeTipAudience
+      )
+    )
+  }
+
   getGitHubCache(): PersistedState['githubCache'] {
     return this[profilePreferencesContext].runtime.state.githubCache
   }
@@ -175,6 +192,17 @@ export class ProfilePreferences {
     this[profilePreferencesContext].runtime.state.githubCache = cache
     this[profilePreferencesContext].runtime.githubCacheDirty = true
     this[profilePreferencesContext].runtime.githubCacheGeneration += 1
+    for (const listener of this[profilePreferencesContext].runtime.githubCacheWriteListeners) {
+      listener()
+    }
+  }
+
+  /** Hears every PR cache save, so a reader keyed off the cache needs no re-read on its own. */
+  onGitHubCacheWritten(listener: () => void): () => void {
+    this[profilePreferencesContext].runtime.githubCacheWriteListeners.add(listener)
+    return () => {
+      this[profilePreferencesContext].runtime.githubCacheWriteListeners.delete(listener)
+    }
   }
 }
 
@@ -234,13 +262,4 @@ export function getFeatureInteractionOperations(
     notifyUIChanged: () => notifyUIChanged(owner),
     getUI: () => owner.getUI()
   }
-}
-
-export function installProfilePreferencesContext(
-  target: ProfilePreferences,
-  source: ProfilePreferences
-): void {
-  Object.defineProperty(target, profilePreferencesContext, {
-    value: source[profilePreferencesContext]
-  })
 }

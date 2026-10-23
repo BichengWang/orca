@@ -65,6 +65,49 @@ async function setup(request = vi.fn(async (_command: string): Promise<unknown> 
 }
 
 describe('Pi turn settlement races', () => {
+  it.each([
+    ['No API key found for anthropic', 'notSignedIn'],
+    ['No API key found elsewhere', 'providerRejected'],
+    ['Rate limit exceeded', 'providerRejected'],
+    ['Network connection failed', 'providerRejected']
+  ] as const)('keeps accepted-turn failure classification: %s', async (detail, kind) => {
+    const h = await setup()
+    await h.start()
+    h.turns.receive({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [],
+        stopReason: 'error',
+        errorMessage: detail
+      }
+    })
+    h.turns.receive({ type: 'agent_settled' })
+    await h.flush()
+    const errors = (await h.rig.rows()).flatMap(({ body }) =>
+      body.kind === 'status' && body.failure ? [body] : []
+    )
+    expect(errors).toHaveLength(1)
+    expect(errors[0]?.failure).toMatchObject({ kind, detail: { text: detail, audience: 'person' } })
+    expect(errors[0]?.text).toContain(detail)
+    if (kind === 'notSignedIn') {
+      expect(errors[0]?.text).toContain('`/login`')
+    }
+  })
+  it.each(['user', 'custom'])(
+    'accepts a steer only at its own echo after a %s message starts an idle run',
+    async (role) => {
+      const h = await setup()
+      h.turns.receive({ type: 'agent_start' })
+      await h.turns.submit('steer', 1, { type: 'prompt', message: 'steer' })
+      h.turns.receive({ type: 'message_end', message: { role, content: [] } })
+      await h.flush()
+      expect(h.accepted).not.toHaveBeenCalled()
+      h.turns.receive({ type: 'message_end', message: { role: 'user', content: [] } })
+      await h.flush()
+      expect(h.accepted).toHaveBeenCalledWith('steer')
+    }
+  )
   it('chooses steering after asynchronous dispatch admission finishes', async () => {
     const h = await setup()
     await h.turns.submit('first', 1, { type: 'prompt', message: 'first' })

@@ -15,18 +15,46 @@ import {
   AgentSessionPreSpawnError
 } from './structured-agent-session-adapter'
 import { withMissingProviderExecutable } from '../../provider-process/provider-executable-missing'
+import { withProviderRequestTimeout } from '../../provider-process/provider-request-timeout'
 import { MAX_UNEXPECTED_EXIT_REASON_CHARS } from './structured-agent-session-dead-generation-settlement'
 import { StructuredAgentArgumentsError } from '../structured-agent-arguments-error'
 import {
   structuredAgentSessionStartFailure,
   withObservedProviderExit
 } from './structured-agent-session-failure-text'
+import { structuredAgentSessionStartFailureRow } from './structured-agent-session-start-failure-row'
 
 /** What Orca's own error text looks like: a code, a marker, a uuid, a path, an exception. */
 const ORCA_INTERNAL =
   /agent_session_|execution_owner|provider_[a-z_]+|[0-9a-f]{8}-[0-9a-f]{4}-|[/\\][\w.-]+[/\\]|Error:|ENOENT/
 
 describe('structuredAgentSessionStartFailure', () => {
+  it('names a provider request that ran out of time, through wrappers, unless the provider exited', () => {
+    const timedOut = withProviderRequestTimeout(new Error('thread/start exceeded 30000ms'), {
+      method: 'thread/start',
+      timeoutMs: 30_000
+    })
+    const wrapped = new Error('codex open failed', { cause: timedOut })
+    expect(structuredAgentSessionStartFailure({ error: wrapped }, { agentName: 'Codex' })).toEqual({
+      reason:
+        'Codex took too long to start (no response to thread/start after 30s). Send your message to try again. If this keeps happening, the computer running this chat may be overloaded.',
+      rejection: {
+        kind: 'startFailed',
+        requestTimeout: { method: 'thread/start', timeoutMs: 30_000 }
+      }
+    })
+    expect(
+      structuredAgentSessionStartFailure(
+        { error: wrapped },
+        { agentName: 'Codex', retryControl: true }
+      ).reason
+    ).toBe(
+      'Codex took too long to start (no response to thread/start after 30s). If this keeps happening, the computer running this chat may be overloaded.'
+    )
+    expect(
+      structuredAgentSessionStartFailure({ error: withObservedProviderExit(wrapped) }).rejection
+    ).toEqual({ kind: 'providerStartFailed' })
+  })
   it('names a saved Arguments option in start and restart failures without exposing its value', () => {
     const error = new StructuredAgentArgumentsError(
       'Codex',
@@ -106,10 +134,62 @@ describe('structuredAgentSessionStartFailure', () => {
     expect(structuredAgentSessionStartFailure({ error: refusal }, { agentName: 'Claude' })).toEqual(
       {
         reason:
-          "Claude isn't signed in. Run `claude` and sign in with /login, or choose an account in Claude Accounts settings.",
+          "Claude isn't signed in. Run `claude auth login`, or choose an account in Claude Accounts settings.",
         rejection: { kind: 'notSignedIn' }
       }
     )
+  })
+
+  it('keeps a person-facing ACP diagnostic through both typed startup paths', () => {
+    const detail = providerDiagnostic(
+      'Grok needs a configured API key. Literal {{agent}}.',
+      'person'
+    )
+    const error = withProviderDiagnostic(
+      new AgentSessionAcquisitionRefusal('signed out', 'notSignedIn'),
+      detail
+    )
+    const direct = structuredAgentSessionStartFailure({ error }, { agentName: 'Grok' })
+    const refused = structuredAgentSessionStartFailure(
+      {
+        refusal: refuse('agent_session_operation_invalid', { reason: 'notSignedIn' }, 'log'),
+        diagnostic: detail
+      },
+      { agentName: 'Grok' }
+    )
+    expect(direct.rejection).toEqual({ kind: 'notSignedIn', detail })
+    expect(refused).toEqual(direct)
+    expect(structuredAgentSessionStartFailureRow('generation', direct)).toMatchObject({
+      body: { kind: 'status', failure: { kind: 'notSignedIn', detail }, text: direct.reason }
+    })
+    expect(direct.reason).toContain('Grok needs a configured API key. Literal {{agent}}.')
+  })
+
+  it.each(['Grok', 'Pi', 'OMP', 'OpenCode'])(
+    'never asks to resend a message when %s fails before one was submitted',
+    (agentName) => {
+      const refusal = refuse('agent_session_operation_invalid', { reason: 'notSignedIn' }, 'log')
+      const startup = structuredAgentSessionStartFailure(
+        { refusal, newSession: true },
+        { agentName }
+      )
+      expect(startup.reason).toContain(`Sign in to ${agentName}`)
+      expect(startup.reason).not.toContain('send your message again')
+      const rejected = structuredAgentSessionStartFailure({ refusal }, { agentName })
+      expect(rejected.reason).toContain('Then send your message again.')
+    }
+  )
+
+  it('keeps direct-create managed account guidance free of resend instructions', () => {
+    const refusal = refuse(
+      'agent_session_operation_invalid',
+      { reason: 'managedAccountUnsupported' },
+      'log'
+    )
+    expect(
+      structuredAgentSessionStartFailure({ refusal, newSession: true }, { agentName: 'Claude' })
+        .reason
+    ).not.toContain('send your message again')
   })
 
   it.each(['managed', 'system'] as const)(
@@ -141,7 +221,7 @@ describe('structuredAgentSessionStartFailure', () => {
     ],
     [
       'accountSwitchInProgress',
-      'A Claude account switch is in progress. Try again after it finishes.'
+      "Claude's setup is changing on this host. Try again after it finishes."
     ],
     [
       'managedAccountUnsupported',

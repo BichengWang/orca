@@ -29,6 +29,7 @@ import {
   type AgentSessionWriteRefusal
 } from './agent-session-write-failure'
 import { agentSessionRefusalReasonWords } from './agent-session-refusal-reason-words'
+import { TUI_AGENT_DISPLAY_NAMES } from './tui-agent-display-names'
 
 export {
   agentSessionRefusalReasonWords,
@@ -46,7 +47,27 @@ const NOT_DONE: Record<AgentSessionWriteKind, AgentSessionWriteNoticeSentence> =
   answer: 'notDoneAnswer',
   option: 'notDoneOption',
   command: 'notDoneCommand',
+  'queued-edit': 'notDoneQueuedEdit',
+  clear: 'notDoneCommand',
+  compact: 'notDoneCommand',
   goal: 'notDoneGoal'
+}
+
+/** A /clear or /compact refused because the agent is working: one plain sentence for every
+ *  reason that is, saying only what the person sees and can do. */
+const COMMAND_WHILE_WORKING: Partial<
+  Record<AgentSessionWriteKind, Partial<Record<string, AgentSessionWriteNoticeSentence[]>>>
+> = {
+  clear: {
+    turnActive: ['agentStillWorking', 'runClearWhenDone'],
+    messagesUnsettled: ['agentStillWorking', 'runClearWhenDone'],
+    promptPending: ['clearAfterAnswer']
+  },
+  compact: {
+    turnActive: ['agentStillWorking', 'runCompactWhenDone'],
+    messagesUnsettled: ['agentStillWorking', 'runCompactWhenDone'],
+    promptPending: ['compactAfterAnswer']
+  }
 }
 
 /** That the write did not happen, for one that a second attempt can carry out. Only the phone says
@@ -69,7 +90,8 @@ function causeParts(
   }
   const saysNotDone =
     (write === 'read-history' && AGENT_SESSION_HISTORY_UNREAD_CAUSES.has(cause)) ||
-    (cause === 'questionChanged' && write === 'answer')
+    (cause === 'questionChanged' && write === 'answer') ||
+    (cause === 'cancelNotSaved' && write === 'stop')
   return saysNotDone ? [cause] : [cause, NOT_DONE[write]]
 }
 
@@ -79,6 +101,16 @@ function reasonParts(
   write: AgentSessionWriteKind,
   context: AgentSessionFailureWordsContext
 ): AgentSessionWriteNoticePart[] | undefined {
+  if (
+    failure.code === 'agent_session_operation_invalid' &&
+    (failure.details?.agentInstallation || failure.details?.codexInstallation) &&
+    (write === 'send' || write === 'composer-send')
+  ) {
+    return [
+      NOT_DONE[write],
+      { failure: { kind: 'startFailed', refusal: failure }, surface: 'rejection', context }
+    ]
+  }
   if (
     failure.code === 'agent_session_operation_invalid' &&
     failure.details?.argumentProblem &&
@@ -94,11 +126,38 @@ function reasonParts(
       }
     ]
   }
+  const commandWhileWorking =
+    failure.code === 'agent_session_operation_invalid'
+      ? COMMAND_WHILE_WORKING[write]?.[failure.details?.reason ?? '']
+      : undefined
+  if (commandWhileWorking) {
+    return commandWhileWorking
+  }
   const words = agentSessionRefusalReasonWords(failure)
   if (!words || 'words' in words) {
     return undefined
   }
+  if ('writes' in words) {
+    if (!words.writes.includes(write)) {
+      return undefined
+    }
+    const agent =
+      failure.code === 'agent_session_operation_invalid' ? failure.details?.agent : undefined
+    const said: AgentSessionWriteNoticePart[] = [
+      {
+        failure: { kind: words.fact },
+        surface: 'row',
+        context: agent ? { ...context, agentName: TUI_AGENT_DISPLAY_NAMES[agent] } : context
+      }
+    ]
+    return context.retryControl && words.action === 'retry' ? said : [...said, words.step]
+  }
   if ('fact' in words) {
+    if (write === 'answer' && words.fact === 'providerExited') {
+      // An approval or question was waiting on the person when its agent stopped: one sentence
+      // that says the answer was not sent, names the agent, and says how to go on.
+      return [{ failure: { kind: words.fact }, surface: 'answer', context }]
+    }
     return write === 'send' || write === 'composer-send'
       ? [
           NOT_DONE[write],
@@ -208,6 +267,13 @@ export function agentSessionUnconfirmedSendParts(
   return [...cause, 'sendOutcomeLost']
 }
 
+/** A message over the host's size bound, caught before it is sent: what to do instead of resending. */
+export const AGENT_SESSION_MESSAGE_TOO_LARGE_PARTS = [
+  'notDoneSend',
+  'messageTooLarge',
+  'shortenMessage'
+] as const satisfies readonly AgentSessionWriteNoticePart[]
+
 export function agentSessionWriteNoticeEnglish(
   parts: readonly AgentSessionWriteNoticePart[]
 ): string {
@@ -226,10 +292,11 @@ export function agentSessionWriteNoticeEnglish(
  *  message is not read. */
 export function agentSessionRefusalNotice(
   refusal: Pick<AgentSessionWireRefusal, 'code' | 'message' | 'details'>,
-  write: AgentSessionWriteKind
+  write: AgentSessionWriteKind,
+  context: AgentSessionFailureWordsContext = {}
 ): string {
   return agentSessionWriteNoticeEnglish(
-    agentSessionWriteNoticeParts(agentSessionRefusalFailure(refusal), write)
+    agentSessionWriteNoticeParts(agentSessionRefusalFailure(refusal), write, context)
   )
 }
 

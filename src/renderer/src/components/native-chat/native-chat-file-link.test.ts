@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Tab } from '../../../../shared/tab-types'
 import type { TerminalTab } from '../../../../shared/terminal-tab-types'
-import type { AppState } from '@/store/types'
 import { folderWorkspaceKey } from '../../../../shared/workspace-scope'
 import { FLOATING_TERMINAL_WORKTREE_ID, getDefaultSettings } from '../../../../shared/constants'
 import { createNativeChatFileHref } from '../../../../shared/native-chat-href-routing'
@@ -9,8 +8,10 @@ import {
   findNativeChatTabOwnerWorktreeId,
   resolveNativeChatFileLink,
   resolveNativeChatFileLinkContext,
-  type NativeChatFileLinkContext
+  type NativeChatFileLinkContext,
+  type NativeChatFileLinkState
 } from './native-chat-file-link'
+import { detectedListingFixture, worktreeFixture } from './native-chat-workspace-test-fixtures'
 
 function terminalTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
   return {
@@ -26,23 +27,23 @@ function terminalTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
   }
 }
 
-function state(overrides: Partial<AppState> = {}): AppState {
+function state(overrides: Partial<NativeChatFileLinkState> = {}): NativeChatFileLinkState {
   return {
+    detectedWorktreesByRepo: {},
     folderWorkspaces: [],
-    getKnownWorktreeById: (worktreeId: string) =>
-      worktreeId === 'wt-1' ? ({ id: 'wt-1', path: '/repo/worktree' } as never) : undefined,
+    floatingWorkspacePath: null,
     projectGroups: [],
     repos: [],
-    settings: { activeRuntimeEnvironmentId: null },
+    settings: { ...getDefaultSettings('/home/me'), activeRuntimeEnvironmentId: null },
     tabsByWorktree: {
       'wt-1': [terminalTab()]
     },
     unifiedTabsByWorktree: {},
     worktreesByRepo: {
-      repo: [{ id: 'wt-1', repoId: 'repo', path: '/repo/worktree' } as never]
+      repo: [worktreeFixture('wt-1', '/repo/worktree')]
     },
     ...overrides
-  } as AppState
+  }
 }
 
 const context: NativeChatFileLinkContext = {
@@ -56,14 +57,18 @@ describe('resolveNativeChatFileLinkContext', () => {
     expect(
       resolveNativeChatFileLinkContext(
         state({
-          settings: { activeRuntimeEnvironmentId: 'env-1' } as AppState['settings']
+          // The client stamps a server's rows on arrival; focus alone never names the owner.
+          worktreesByRepo: {
+            repo: [{ ...worktreeFixture('wt-1', '/repo/worktree'), hostId: 'runtime:env-1' }]
+          }
         }),
         'tab-1'
       )
     ).toEqual({
       worktreeId: 'wt-1',
       worktreePath: '/repo/worktree',
-      runtimeEnvironmentId: 'env-1'
+      runtimeEnvironmentId: 'env-1',
+      sourceTabId: 'tab-1'
     })
   })
 
@@ -95,24 +100,25 @@ describe('resolveNativeChatFileLinkContext', () => {
         }),
         structuredTab.id
       )
-    ).toEqual(context)
+    ).toEqual({ ...context, sourceTabId: structuredTab.id })
   })
 
-  it('falls back to repo-scoped worktrees when a known worktree has no path', () => {
+  it('resolves a detected-only workspace from the supplied snapshot catalog', () => {
     expect(
       resolveNativeChatFileLinkContext(
         state({
-          getKnownWorktreeById: () => ({ id: 'wt-1' }) as never,
-          worktreesByRepo: {
-            repo: [{ id: 'wt-1', repoId: 'repo', path: '/repo/fallback' } as never]
+          worktreesByRepo: {},
+          detectedWorktreesByRepo: {
+            repo: detectedListingFixture([worktreeFixture('wt-1', '/repo/detected')])
           }
         }),
         'tab-1'
       )
     ).toEqual({
       worktreeId: 'wt-1',
-      worktreePath: '/repo/fallback',
-      runtimeEnvironmentId: null
+      worktreePath: '/repo/detected',
+      runtimeEnvironmentId: null,
+      sourceTabId: 'tab-1'
     })
   })
 
@@ -124,7 +130,6 @@ describe('resolveNativeChatFileLinkContext', () => {
       resolveNativeChatFileLinkContext(
         state({
           tabsByWorktree: { [folderKey]: [folderTab] },
-          getKnownWorktreeById: () => undefined,
           folderWorkspaces: [{ id: folderId, folderPath: '/workspace/platform' } as never],
           worktreesByRepo: {}
         }),
@@ -133,7 +138,8 @@ describe('resolveNativeChatFileLinkContext', () => {
     ).toEqual({
       worktreeId: folderKey,
       worktreePath: '/workspace/platform',
-      runtimeEnvironmentId: null
+      runtimeEnvironmentId: null,
+      sourceTabId: folderTab.id
     })
   })
 })
@@ -154,11 +160,10 @@ describe('floating workspace native chat', () => {
     agentSessionAgent: 'codex'
   } satisfies Tab
 
-  function floatingState(floatingWorkspacePath: string | null): AppState {
+  function floatingState(floatingWorkspacePath: string | null): NativeChatFileLinkState {
     return state({
       tabsByWorktree: {},
       unifiedTabsByWorktree: { [FLOATING_TERMINAL_WORKTREE_ID]: [floatingTab] },
-      getKnownWorktreeById: () => undefined,
       worktreesByRepo: {},
       // Why a focused runtime: floating must stay local even when one is selected.
       settings: { ...getDefaultSettings('/home/me'), activeRuntimeEnvironmentId: 'env-1' },
@@ -184,7 +189,8 @@ describe('floating workspace native chat', () => {
     expect(resolveNativeChatFileLinkContext(pinned, floatingTab.id)).toEqual({
       worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
       worktreePath: '/home/me/pinned',
-      runtimeEnvironmentId: null
+      runtimeEnvironmentId: null,
+      sourceTabId: floatingTab.id
     })
   })
 
