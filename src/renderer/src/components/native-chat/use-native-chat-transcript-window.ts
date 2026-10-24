@@ -41,10 +41,9 @@ export type NativeChatTranscriptWindow = {
   measureRow: (node: HTMLElement | null) => void
   /** Scroll so this element's top meets the top of the viewport. */
   alignToViewportTop: (element: HTMLElement) => void
-  /** Whether that scroll is still travelling: true until the view reaches its
-   *  target, or another write or the reader takes the scroll from it. */
+  /** Whether a jump is still settling as its target row is measured. */
   isAlignPending: () => boolean
-  /** A reader gesture that scrolls the transcript ends a scroll still travelling. */
+  /** A reader gesture releases the jump's target. */
   cancelAlign: () => void
   /** Pin to the transcript's end. Through the virtualizer for the same reason
    *  the reveal is: it owns the offset, and a write it does not recognise as its
@@ -65,6 +64,7 @@ export function useNativeChatTranscriptWindow({
   slots,
   isVisible,
   revealIndex,
+  newRowsMarkerIndex,
   typography = DEFAULT_ROW_TYPOGRAPHY
 }: {
   scrollRef: React.RefObject<HTMLDivElement | null>
@@ -72,6 +72,8 @@ export function useNativeChatTranscriptWindow({
   isVisible: boolean
   /** Slot the transcript was asked to reveal, or -1. */
   revealIndex: number
+  /** Slot drawing the "New" marker, or -1. */
+  newRowsMarkerIndex?: number
   /** Chat text scale; gap scales with the text size. */
   typography?: NativeChatRowTypography
 }): NativeChatTranscriptWindow {
@@ -82,8 +84,8 @@ export function useNativeChatTranscriptWindow({
   const previousMeasurementKeysRef = useRef<ReadonlySet<string> | null>(null)
   const retiredMeasurementCountRef = useRef(0)
   const pinned = useMemo(
-    () => nativeChatPinnedRowIndexes({ count: slots.length, revealIndex }),
-    [slots.length, revealIndex]
+    () => nativeChatPinnedRowIndexes({ count: slots.length, revealIndex, newRowsMarkerIndex }),
+    [slots.length, revealIndex, newRowsMarkerIndex]
   )
   // A content-only tail revision must not rebuild measured offsets: doing so
   // breaks the end anchor while the row grows. Structural changes replace it.
@@ -124,19 +126,7 @@ export function useNativeChatTranscriptWindow({
     // Every virtualizer write uses this public adapter, including measurement
     // adjustments and prepend anchoring, so scroll events have one provenance.
     scrollToFn: (offset, options, instance) => {
-      const target = offset + (options.adjustments ?? 0)
       const element = instance.scrollElement
-      if (options.behavior === 'smooth') {
-        if (element) {
-          const max = Math.max(0, element.scrollHeight - element.clientHeight)
-          const landing = Math.max(0, Math.min(target, max))
-          if (element.scrollTop !== landing) {
-            programmaticScrollMarks.mark(landing)
-          }
-        }
-        elementScroll(offset, options, instance)
-        return
-      }
       const previous = element?.scrollTop
       elementScroll(offset, options, instance)
       // Scroll events dispatch later; read back now so a clamp against the old

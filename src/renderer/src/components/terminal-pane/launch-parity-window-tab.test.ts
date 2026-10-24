@@ -14,6 +14,12 @@ import {
 } from '@/lib/launch-parity-renderer.test-fixture'
 import { getDefaultSettings } from '../../../../shared/constants'
 import { WINDOW_LAUNCH_CASES } from '../../../../shared/launch-parity-window-cases.test-fixture'
+import { PLUS_LAUNCH_CASES } from '../../../../shared/launch-parity-plus-cases.test-fixture'
+import { WORKSPACE_START_LAUNCH_CASES } from '../../../../shared/launch-parity-workspace-start-cases.test-fixture'
+import {
+  loadWorkspaceStartModules,
+  startWorkspaceAgent
+} from '@/lib/launch-parity-workspace-start.test-fixture'
 import {
   LAUNCH_TAB_ID,
   LAUNCH_TOKEN,
@@ -22,6 +28,13 @@ import {
   windowSpawnRequest,
   type WindowLaunchCase
 } from '../../../../shared/launch-parity-window-request.test-fixture'
+
+// Main's answer to the window's layout commands, as a switch-on build sends them.
+vi.mock('@/runtime/runtime-rpc-client', async (importOriginal) =>
+  (
+    await import('@/runtime/layout-apply-test-transport.test-fixture')
+  ).runtimeRpcClientWithLayoutApply(await importOriginal())
+)
 
 const holder = vi.hoisted((): LaunchStoreHolder => ({ store: null }))
 vi.mock('@/store', async () =>
@@ -39,6 +52,12 @@ vi.mock('react', async (importOriginal) => {
   const actual = await importOriginal<typeof React>()
   return { ...actual, useCallback: <T>(fn: T): T => fn }
 })
+// Row 8: what precedes the launch (setup policy and hooks trust) is decided, not asked.
+vi.mock('@/lib/launch-work-item-direct-preflight', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  resolveDirectSetupDecision: async () => ({ kind: 'decided', decision: 'inherit' })
+}))
+vi.mock('@/lib/ensure-hooks-confirmed', () => ({ ensureHooksConfirmed: async () => 'run' }))
 vi.mock('@/lib/windows-terminal-capabilities', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   hasCachedWindowsTerminalCapabilities: () => true,
@@ -58,7 +77,8 @@ const load = perClientLoader(async () => ({
   pane: await import('./pty-connection'),
   paneOptions: await import('./terminal-pane-manager-options'),
   defaults: await import('@/lib/pane-manager/pane-terminal-options'),
-  lifecycle: await import('./terminal-pane-lifecycle-primitives')
+  lifecycle: await import('./terminal-pane-lifecycle-primitives'),
+  workspaceStart: await loadWorkspaceStartModules()
 }))
 
 /** Runs the case's real producer against a real store; returns the tab it opened. */
@@ -73,7 +93,9 @@ async function openTab(c: WindowLaunchCase) {
   )
   const worktreeId = launchWorkspaceId(c.workspace)
   const producer = c.producer
-  if (producer.kind === 'quick-command') {
+  if (producer.kind === 'work-item' || producer.kind === 'folder-composer') {
+    await startWorkspaceAgent(modules.workspaceStart, store, { ...c, producer })
+  } else if (producer.kind === 'quick-command') {
     modules.quick.runQuickCommandInNewTab({
       command: { id: 'qc-1', label: 'Fix', action: 'agent-prompt', ...producer },
       worktreeId
@@ -88,6 +110,15 @@ async function openTab(c: WindowLaunchCase) {
       promptDelivery: 'draft',
       launchSource: 'terminal_context_menu',
       initialCwd: producer.initialCwd
+    })
+  } else if (producer.kind === 'plus') {
+    // Hand-built copies of what the "+" menu and the new-agent shortcut pass.
+    modules.launch.launchAgentInNewTab({
+      requestId: `parity-${c.name}`,
+      agent: producer.agent,
+      worktreeId,
+      groupId: store.getState().activeGroupIdByWorktree[worktreeId],
+      launchSource: producer.via === 'menu' ? 'tab_bar_quick_launch' : 'shortcut'
     })
   } else {
     // The sidebar's "continue from transcript" builds the startup, then opens the tab.
@@ -175,7 +206,7 @@ async function paneSpawnRequest(c: WindowLaunchCase): Promise<unknown> {
   )
 }
 
-// Pins main's current launch behaviour as the convergence parity baseline (rows 2 and 6, window
+// Pins main's current launch behaviour as the convergence parity baseline (rows 1, 2 and 6, window
 // half): the real producer, store and pane build the pty:spawn request each case's table row names.
 // C2 (typed-prompt tabs onto the pane trigger) and C3 (Antigravity continue) check against it.
 describe('window-tab producers: the pty:spawn request a real pane sends', () => {
@@ -190,7 +221,10 @@ describe('window-tab producers: the pty:spawn request a real pane sends', () => 
     vi.unstubAllGlobals()
   })
 
-  it.each(WINDOW_LAUNCH_CASES)('row $row: $name', async (c) => {
-    expect(await paneSpawnRequest(c)).toEqual(windowSpawnRequest(c))
-  })
+  it.each([...WINDOW_LAUNCH_CASES, ...PLUS_LAUNCH_CASES, ...WORKSPACE_START_LAUNCH_CASES])(
+    'row $row: $name',
+    async (c) => {
+      expect(await paneSpawnRequest(c)).toEqual(windowSpawnRequest(c))
+    }
+  )
 })

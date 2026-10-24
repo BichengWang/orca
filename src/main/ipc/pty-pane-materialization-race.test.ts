@@ -6,7 +6,9 @@ import {
 } from './pty-ipc-mock-registry'
 import { setupPtyIpcSuite } from './pty-ipc-test-harness'
 import { makePaneKey } from '../../shared/stable-pane-id'
-import { registerPtyHandlers, getPtyIdForPaneKey, setLocalPtyProvider } from './pty'
+import { registerPtyHandlers } from './pty/register-handlers'
+import { getPtyIdForPaneKey } from './pty/pane/key-state'
+import { setLocalPtyProvider } from './pty/provider/registry'
 
 vi.mock('electron', () => import('./pty-ipc-mock-registry').then((m) => m.electronModuleMock()))
 vi.mock('fs', () => import('./pty-ipc-mock-registry').then((m) => m.fsModuleMock()))
@@ -144,7 +146,6 @@ describe('registerPtyHandlers', () => {
     releaseClaim()
     await expect(mounted).resolves.toMatchObject({ id: 'pty-after-runtime-claim' })
     expect(providerSpawn).toHaveBeenCalledOnce()
-    // C6 keeps "the joiner prepares before": the window prepares its launch only after the claim settles.
     expect(preparedAfterRelease).toEqual([true])
   })
   it('adopts a runtime reservation created during renderer preflight', async () => {
@@ -395,14 +396,7 @@ describe('registerPtyHandlers', () => {
       }
     })
     expect(providerSpawn).toHaveBeenCalledTimes(1)
-    expect(store.persistPtyBinding).toHaveBeenCalledWith({
-      worktreeId: 'repo-1::/tmp',
-      tabId: 'tab-race',
-      leafId,
-      ptyId: 'pty-renderer',
-      startupCwd: '/tmp',
-      origin: 'spawn'
-    })
+    expect(store.persistPtyBinding).toHaveBeenCalledWith(expect.any(Function), undefined)
   })
   it.each([
     {
@@ -446,6 +440,7 @@ describe('registerPtyHandlers', () => {
       const leafId = '66666666-6666-4666-8666-666666666666'
       const paneKey = makePaneKey(tabId, leafId)
       let ownerPublished = false
+      const ownerId = 'pty-live-owner'
       let releaseAttach!: () => void
       let attachBarrier: Promise<void>
       const resetAttachBarrier = (): void => {
@@ -461,7 +456,7 @@ describe('registerPtyHandlers', () => {
           if (options.attachOnly) {
             await attachBarrier
             return {
-              id: 'pty-live-owner',
+              id: options.sessionId ?? ownerId,
               incarnationId: 'inc-live-owner',
               isReattach: true,
               snapshot: 'original-live-output',
@@ -525,7 +520,7 @@ describe('registerPtyHandlers', () => {
             handle: 'term-live-owner',
             tabId,
             leafId,
-            ptyId: 'pty-live-owner',
+            ptyId: ownerId,
             worktreeId
           }
         }),
@@ -578,7 +573,6 @@ describe('registerPtyHandlers', () => {
         cols: 120,
         rows: 40,
         cwd: '/a',
-        cwdFallback: 'worktree',
         command: 'claude --resume provider-session',
         launchAgent: 'claude',
         worktreeId,

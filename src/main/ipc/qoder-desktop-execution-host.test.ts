@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { setupPtyIpcSuite } from './pty-ipc-test-harness'
 import { createDaemonActiveProviderFixtures } from './pty-ipc-daemon-provider-fixtures'
-import { registerPtyHandlers } from './pty'
+import { registerPtyHandlers } from './pty/register-handlers'
 import { isCommandOnPath } from './preflight-command-exec'
 import { detectWslCommandsOnPath } from './preflight-wsl-agent-detection'
 import type * as FsPromises from 'node:fs/promises'
@@ -11,7 +11,7 @@ import { buildAgentResumeStartupPlan } from '../../shared/tui-agent-startup'
 import type { PtySpawnIpcArgs } from './pty/ipc/spawn-types'
 
 vi.mock('./preflight-command-exec', () => ({ isCommandOnPath: vi.fn() }))
-vi.mock('./local-agent-install-dir-detection', () => ({
+vi.mock('../../shared/local-agent-install-dir-detection', () => ({
   detectCommandsInInstallDirs: () => new Set()
 }))
 vi.mock('./preflight-wsl-agent-detection', () => ({
