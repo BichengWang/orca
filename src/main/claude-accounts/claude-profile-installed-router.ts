@@ -1,10 +1,11 @@
 import { lstatSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-// Why type-only: scan workers import this module, and the router's setup graph must not load there.
+// Keep the router setup graph out of scan workers.
 import type { ClaudeProfileRouter } from './claude-profile-router'
+import type { ClaudeWslProfileRouter } from './claude-profile-wsl-router'
 import type { ClaudeAccountSelectionTarget } from './runtime-selection'
 
-/** A real directory; a link is false, so a history folder shared by link is not read twice. */
+/** Exclude linked history directories to avoid reading them twice. */
 export function isDirectory(path: string): boolean {
   try {
     return lstatSync(path).isDirectory()
@@ -26,7 +27,7 @@ export function listClaudeProfileHomes(dataRoot: string): string[] {
 
 let installed: ClaudeProfileRouter | undefined
 
-/** Installed by the host runtime only when routing is enabled; workers and child processes have none. */
+/** Installed only in the desktop process. */
 export function installClaudeProfileRouter(router: ClaudeProfileRouter | undefined): void {
   installed = router
 }
@@ -35,20 +36,27 @@ export function getClaudeProfileRouter(): ClaudeProfileRouter | undefined {
   return installed
 }
 
-/** A local or WSL pane's env with the routed account's pointer added; SSH panes keep theirs. */
+let installedWsl: ClaudeWslProfileRouter | undefined
+
+export function installClaudeWslProfileRouter(router: ClaudeWslProfileRouter | undefined): void {
+  installedWsl = router
+}
+
+export function getClaudeWslProfileRouter(): ClaudeWslProfileRouter | undefined {
+  return installedWsl
+}
+
 export function withClaudeProfileTerminalEnv<Env extends Record<string, string> | undefined>(
   env: Env,
-  connectionId: string | null | undefined,
   target: ClaudeAccountSelectionTarget
 ): Env | Record<string, string> {
-  const profileEnv = connectionId ? undefined : installed?.terminalEnv(target)
+  const profileEnv = installed?.terminalEnv(target)
   return profileEnv ? { ...env, ...profileEnv } : env
 }
 
-/**
- * Account `<surface>` folders the System default readers cannot see. Step 1 links history into the
- * System default on macOS/Linux, so only Windows (or a cross-filesystem refusal) adds any.
- */
+/** Account homes plus the user's CLAUDE_CONFIG_DIR, which a Dock launch only learns from the login shell. */
 export function claudeProfileHistoryDirs(surface: 'projects' | 'transcripts'): string[] {
-  return (installed?.accountHomes() ?? []).map((home) => join(home, surface)).filter(isDirectory)
+  const userConfigDir = installed?.userConfigDir()
+  const homes = [...(userConfigDir ? [userConfigDir] : []), ...(installed?.accountHomes() ?? [])]
+  return homes.map((home) => join(home, surface)).filter(isDirectory)
 }

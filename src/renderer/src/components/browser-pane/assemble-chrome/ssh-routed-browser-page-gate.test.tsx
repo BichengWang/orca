@@ -20,6 +20,7 @@ vi.mock('../host-guest/webview-registry', () => ({
 import { SshRoutedBrowserPageGate } from './ssh-routed-browser-page-gate'
 
 const PAGE_IDS = ['page-1', 'page-2'] as const
+const initialHostState = useAppStore.getState()
 
 const settle = () =>
   act(async () => {
@@ -28,6 +29,14 @@ const settle = () =>
 
 describe('SshRoutedBrowserPageGate', () => {
   beforeEach(() => {
+    useAppStore.setState({
+      sshConnectionStates: new Map([
+        [
+          'target-a',
+          { targetId: 'target-a', status: 'connected', error: null, reconnectAttempt: 0 }
+        ]
+      ])
+    })
     mocks.prepare.mockReset().mockResolvedValue({ partition: 'persist:orca-browser-v1-routed' })
     mocks.destroyPersistentWebview.mockReset()
     Object.defineProperty(window, 'api', {
@@ -35,7 +44,10 @@ describe('SshRoutedBrowserPageGate', () => {
       value: { browser: { prepareSshWorkspacePartition: mocks.prepare } }
     })
   })
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    useAppStore.setState({ sshConnectionStates: initialHostState.sshConnectionStates })
+  })
 
   it('renders children with no override for non-SSH workspaces without any prepare call', async () => {
     mocks.executionHostId = 'local'
@@ -175,9 +187,7 @@ describe('SshRoutedBrowserPageGate', () => {
   })
 
   it('unmounts unrouted pages in the SAME render a target appears, and destroys their guests', async () => {
-    // Why (review P1-1): the routed decision lags state by one commit on an
-    // already-mounted instance; a stale 'unrouted' render would mount a
-    // local-egress webview behind the preparing card, and unmount only parks it.
+    // A stale unrouted render could create a local-egress guest behind the card; unmounting only parks it.
     mocks.executionHostId = 'local'
     mocks.prepare.mockResolvedValue({ partition: 'persist:orca-browser-v1-routed' })
     const view = render(

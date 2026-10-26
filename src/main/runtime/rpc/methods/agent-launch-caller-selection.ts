@@ -1,12 +1,6 @@
-/**
- * Which view a launch moves: the requesting connection's, never the host's or another client's.
- *
- * A paired client (a phone, or a desktop client of a remote server) that launches into an existing
- * workspace gets the new tab as its own selection, recorded the way `session.tabs.createTerminal`
- * selects the tab it creates for its caller. In-process callers keep today's behaviour, and their
- * launch that creates its workspace keeps `worktree.create`'s navigation. A paired client's create
- * never activates the host window: its setup and default tabs are provisioned in the background.
- */
+/** Paired launches move only the requesting connection's view.
+ * Existing/folder targets select the tab; worktree creates provision setup/default tabs in the background.
+ * In-process callers retain host navigation; folder creation activates nothing. */
 
 import type { AgentLaunchTarget } from '../../../../shared/agent-launch-intent'
 import type { AgentLaunchPublishedSurface } from '../../../agent-launch/agent-launch-executor'
@@ -19,7 +13,7 @@ export function agentLaunchCallerNavigationId(
   target: AgentLaunchTarget,
   context: Pick<RpcContext, 'caller'>
 ): string | null {
-  return target.kind === 'existing' && context.caller?.kind === 'paired-device'
+  return target.kind !== 'create-worktree' && context.caller?.kind === 'paired-device'
     ? context.caller.deviceId
     : null
 }
