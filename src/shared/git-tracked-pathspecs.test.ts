@@ -1,5 +1,17 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { partitionTrackedPathSpecs } from './git-tracked-pathspecs'
+
+function countNormalizations(run: () => unknown): number {
+  const replace = vi.spyOn(String.prototype, 'replace')
+  try {
+    run()
+    return replace.mock.calls.filter(
+      ([pattern]) => pattern instanceof RegExp && pattern.source === '\\\\'
+    ).length
+  } finally {
+    replace.mockRestore()
+  }
+}
 
 describe('tracked pathspec partition', () => {
   it.each([
@@ -16,7 +28,10 @@ describe('tracked pathspec partition', () => {
     [':(glob)*', ['a.txt'], false],
     ['a b/é', ['a b/é/file\nname'], true],
     ['é', ['e\u0301'], false],
-    ['', [], false]
+    ['', [], false],
+    ['', ['relative'], false],
+    ['', ['/absolute'], true],
+    ['/', [''], true]
   ] as const)(
     'matches only literal files or descendants for %j against %j',
     (request, tracked, expected) => {
@@ -75,5 +90,17 @@ describe('tracked pathspec partition', () => {
   it('does not reuse tracked evidence across operations', () => {
     expect(partitionTrackedPathSpecs(['docs'], ['docs/file'], false).trackedPaths).toEqual(['docs'])
     expect(partitionTrackedPathSpecs(['docs'], [], false).untrackedPaths).toEqual(['docs'])
+  })
+
+  it('normalizes each visited tracked entry once and each request once per operation', () => {
+    const requests = Array.from({ length: 64 }, (_, index) => `missing/${index}`)
+    const tracked = Array.from({ length: 256 }, (_, index) => `docs\\file-${index}///`)
+    expect(countNormalizations(() => partitionTrackedPathSpecs(requests, tracked, true))).toBe(320)
+  })
+
+  it('retains early exit for a selected directory with many tracked descendants', () => {
+    const tracked = Array.from({ length: 64 }, (_, index) => `docs/file-${index}`)
+    expect(countNormalizations(() => partitionTrackedPathSpecs(['docs'], tracked, true))).toBe(2)
+    expect(countNormalizations(() => partitionTrackedPathSpecs([], tracked, true))).toBe(0)
   })
 })
