@@ -1,5 +1,4 @@
-// Handing one accepted message to the provider: two commits around a provider call that runs
-// outside the session's serialize, so a send is accepted while the call is in flight.
+// Commit pending/settlement around an external provider call so concurrent sends remain acceptable.
 
 import {
   agentSessionFailureFact,
@@ -18,7 +17,9 @@ import type {
 import { DISPATCH_DOUBT_PERSISTENCE_FAILED } from '../agent-session-journal/journal-dispatch-doubt-reasons'
 import { contextStructuredAgentSessionCurrentWork } from './structured-agent-session-current-work'
 import type { AgentSessionDispatchOutcome } from './structured-agent-session-adapter'
+import type { JournalOperationReceipt } from '../agent-session-journal/journal-row-writer'
 import { agentJournalSubmissionKey } from '../../../shared/agent-session-journal-item-key'
+import { AgentSessionPreDispatchError } from './structured-agent-session-operation-settlement'
 import {
   handOverStructuredAgentSessionCommand,
   structuredAgentSessionHandoverOrigin,
@@ -36,28 +37,22 @@ export type AgentSessionHandoverContext = StructuredAgentSessionCommandHandoverC
   acquireAborts?: Pick<StructuredAgentSessionAcquireAborts, 'begin'>
   deliveryOrder?: StructuredAgentSessionDeliveryOrder
   workChanged?: () => void
-  /** A message the agent took: a chat keeps, where it has none saved, the options it ran. */
+  /** Retain executed options only when the chat has no saved choice. */
   recordRanOptions?: ReturnType<StructuredAgentSessionRanRecorder>
 }
 
-/** A handover whose pending row and abort handle are committed: the provider call runs outside the
- *  session's serialize and answers with the commit that resolves it. */
 export type StructuredAgentSessionPendingHandover = {
   dispatch: () => Promise<() => Promise<void>>
   release?: () => void
 }
 
-/**
- * Hands one queued submission to the provider. The `dispatch{pending}` row goes first: a crash
- * after it leaves a message in doubt, never one that reads as queued and so provably unwritten.
- * The abort handle a Stop reaches the call by is begun before that row, in the same step, so no
- * Stop falls between them. Null when the handover finished in this step (a command, a lost body).
- */
+/** Register abort before pending-row commit so Stop cannot fall between them.
+ * Pending before dispatch makes crash delivery uncertain, never provably unwritten. */
 export async function beginSubmissionHandover(
   ctx: AgentSessionHandoverContext,
   submission: AgentJournalSubmission,
-  /** Whether the child the row was written for is still the one to call. */
-  stillCurrent: () => boolean
+  stillCurrent: () => boolean,
+  keepsTurn?: (providerTurn: () => string | null) => boolean
 ): Promise<StructuredAgentSessionPendingHandover | null> {
   const { clientMessageId } = submission
   const body = ctx.journal.itemBody(agentJournalSubmissionKey(clientMessageId))
@@ -79,13 +74,11 @@ export async function beginSubmissionHandover(
     )
     return null
   }
-  // The message joins the turn the child it goes to is running, a steer, or opens its own; never a
-  // turn an ended generation left. A new turn carries the stopped messages owed to the agent, named
-  // on this same row before anything is written.
+  // Join only current turns; persist stopped-history carry before writing to the provider.
   const turnScope = contextStructuredAgentSessionCurrentWork(ctx).turnScope()
   const carried = carriedStoppedHistory(ctx, turnScope, submission, body)
   const release = ctx.deliveryOrder?.activateSend(ctx.sessionId, clientMessageId)
-  // The pending row precedes the adapter's own report of which sends it holds.
+  // Pending rows precede the adapter’s held-send evidence.
   const released = beginStructuredAgentSessionHandover(
     ctx.journal,
     clientMessageId,
@@ -93,22 +86,31 @@ export async function beginSubmissionHandover(
   )
   const attempt = ctx.acquireAborts?.begin(ctx.sessionId, true)
   const queued = submission.queuedMessageId !== undefined
+  const executionOptions = keepsTurn ? undefined : submission.options
+  let reconsider = false
+  const pending = (receipt?: JournalOperationReceipt) =>
+    ctx.journal.resolveDispatch(
+      {
+        clientMessageId,
+        state: 'pending',
+        fence: ctx.fence,
+        turnScope,
+        ...(carried ? { carries: carried.covers } : {})
+      },
+      undefined,
+      receipt
+    )
   try {
-    await ctx.journal.resolveDispatch({
-      clientMessageId,
-      state: 'pending',
-      fence: ctx.fence,
-      turnScope,
-      ...(carried ? { carries: carried.covers } : {})
-    })
+    if (!keepsTurn) {
+      await pending()
+    }
   } catch (error) {
     released()
     release?.()
     attempt?.end()
     throw error
   }
-  // The handover row's instant on the host clock; the turn this dispatch opens records it so the
-  // live counter never re-anchors at turn-open.
+  // Preserve handover time so turn-open cannot re-anchor elapsed work.
   const requestedAt = structuredAgentSessionHandoverOrigin(ctx.journal, submission)
   return {
     release: () => {
@@ -118,29 +120,58 @@ export async function beginSubmissionHandover(
     dispatch: async () => {
       let outcome: AgentSessionDispatchOutcome | null
       try {
-        // Aborted before the call, Orca still held it: a queued card waits again.
+        // Pre-call abort proves queued cards never reached the provider.
         outcome = attempt?.signal.aborted
           ? cancelledDispatch(queued)
-          : // A child gone since the row: its end settles the row, and nothing reaches the wire.
+          : // Ended-child settlement owns the row; never write to a replaced child.
             stillCurrent()
             ? await dispatchSafely(
                 ctx,
                 clientMessageId,
                 carried ? withStoppedHistory(body, carried.messages) : body,
                 requestedAt,
-                submission.options,
+                executionOptions,
                 queued,
-                attempt?.signal
+                attempt?.signal,
+                keepsTurn
+                  ? async (offer, providerTurn) => {
+                      let written!: Promise<void>
+                      let origin!: number
+                      await pending({
+                        write: (_db, row) => {
+                          if (!row) {
+                            throw new Error('pending dispatch receipt has no row')
+                          }
+                          origin = row.ts
+                          attempt?.signal.throwIfAborted()
+                          if (!stillCurrent() || !keepsTurn(providerTurn)) {
+                            reconsider = true
+                            throw new AgentSessionPreDispatchError('steer-target-ended')
+                          }
+                        },
+                        committed: () => {
+                          written = offer(origin)
+                          // The offer stays observed even if the subsequent fold throws.
+                          void written.catch(() => undefined)
+                        }
+                      })
+                      await written
+                    }
+                  : undefined
               )
             : null
       } finally {
         attempt?.end()
       }
+      if (reconsider) {
+        return async () => undefined
+      }
+      // The journal writer orders proof before teardown; the host lane may be closing the child.
+      await resolveHandover(ctx, clientMessageId, outcome)
       return async () => {
-        await resolveHandover(ctx, clientMessageId, outcome)
         if (outcome?.state === 'accepted' || outcome?.state === 'admitted') {
           await ctx.recordRanOptions?.({
-            message: submission.options,
+            message: executionOptions,
             executed: outcome.ranOptions
           })
         }
@@ -154,7 +185,6 @@ async function resolveHandover(
   clientMessageId: string,
   outcome: AgentSessionDispatchOutcome | null
 ): Promise<void> {
-  // An admission needs no dispatch row: the submission is already pending.
   if (!outcome || outcome.state === 'admitted') {
     return
   }
@@ -179,8 +209,7 @@ async function resolveHandover(
           : { clientMessageId, state: 'unknown', reason: outcome.reason, fence: ctx.fence }
     )
   } catch (error) {
-    // A failed resolution must not strand a pending row; an unknown result is
-    // explicitly replayable.
+    // Persist uncertainty if settlement fails; next-open recovery handles any remaining pending row.
     try {
       await ctx.journal.resolveDispatch({
         clientMessageId,
@@ -188,17 +217,12 @@ async function resolveHandover(
         reason: DISPATCH_DOUBT_PERSISTENCE_FAILED,
         fence: ctx.fence
       })
-    } catch {
-      // Nothing further to record; the pending row is settled on the next open.
-    }
+    } catch {}
     throw error
   }
 }
 
-/** A thrown adapter error is indistinguishable from a lost reply, so it settles as `unknown`, never
- *  replayed. Only a child that proved its start is handed anything, so a start that fails leaves its
- *  messages unsent instead (the delivery loop's barrier); an adapter that knows a write never
- *  happened answers `rejected`. */
+/** Adapter throws may be lost replies; never resend. Only explicit rejection proves non-delivery. */
 async function dispatchSafely(
   ctx: AgentSessionHandoverContext,
   clientMessageId: string,
@@ -206,7 +230,10 @@ async function dispatchSafely(
   requestedAt: number,
   executionOptions: AgentSessionExecutionOptions | undefined,
   queued: boolean,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  admitPreparedInput?: Parameters<
+    AgentSessionHandoverContext['adapter']['dispatch']
+  >[0]['admitPreparedInput']
 ): Promise<AgentSessionDispatchOutcome> {
   try {
     const outcome = await ctx.adapter.dispatch({
@@ -217,13 +244,13 @@ async function dispatchSafely(
       ...(signal ? { signal } : {}),
       fence: ctx.fence,
       requestedAt,
+      ...(admitPreparedInput ? { admitPreparedInput } : {}),
       onInputPreparation: ctx.recordRanOptions?.prepareInput,
       onExecutionSnapshot: ctx.recordRanOptions?.checkpoint
     })
-    // The agent's own answer stands, aborted or not.
     return outcome
   } catch (error) {
-    // The signal reaches only an adapter's preparation, so its own reason proves nothing was written.
+    // This signal affects preparation only; its original reason proves no provider write.
     if (isAbortSignalReason(signal, error)) {
       return cancelledDispatch(queued)
     }
@@ -240,8 +267,7 @@ async function dispatchSafely(
   }
 }
 
-/** Only a queued card's hand-off records the proof; on a direct send it would owe the message as
- *  stopped history. */
+/** Non-delivery proof applies only to queued handoffs; direct sends still owe stopped-history handling. */
 function cancelledDispatch(neverReachedAgent: boolean): AgentSessionDispatchOutcome {
   return {
     state: 'rejected',
